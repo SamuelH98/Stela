@@ -5,6 +5,11 @@
 //! programs its country, `mt7925_mac_init` and `mt7925_start` bring up its
 //! MAC on mac80211's default channel, and `mt7925_add_interface` registers
 //! its station interface, which a [`Station`] then keeps connected.
+//!
+//! MT7921 (Connac2) attaches only as far as `mt7921_pci_probe`'s firmware
+//! boot: its station layer is not ported, so [`attach`] reports what the
+//! booted function says ([`Booted`]) and returns
+//! [`AttachError::StationNotPorted`] rather than a link.
 use super::{
     acpi::Sar,
     bootstrap::{
@@ -18,11 +23,12 @@ use super::{
         clc::{Environment as ClcEnvironment, Inputs as ClcInputs},
     },
     identity::{Chip, PciIdentity},
+    mailbox::CapabilityReport,
     mcu::device::Context,
     station::{Station, Wifi},
 };
 use crate::{
-    Clock,
+    Clock, Mac,
     bus::dma::{mapping::DmaDomain, memory::PageSource},
     firmware::Provider,
     wifi::{
@@ -56,8 +62,12 @@ pub struct Inputs {
 /// still reach stays held.
 #[derive(Debug)]
 pub enum AttachError {
-    /// Only MT7925's regulatory programming is ported.
+    /// Only MT7925 and MT7921's firmware boot are ported.
     UnsupportedChip(PciIdentity),
+    /// The firmware booted and answered its capability query, but the
+    /// chip's station layer is not ported, so no link starts. The function
+    /// stays held like any attach that failed after its firmware booted.
+    StationNotPorted(Booted),
     /// No regulatory database loaded, so the radio may not transmit.
     NoRegulatoryDatabase,
     /// regulatory.db holds no usable rules for the network's country.
@@ -73,6 +83,51 @@ pub enum AttachError {
     Link(LinkControlError),
 }
 
+/// What a function whose firmware booted reports before any station exists:
+/// the chip, the station address and the bands its capability query named.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Booted {
+    pub chip: Chip,
+    /// The firmware's raw address, which is not validated or replaced.
+    pub address: Option<Mac>,
+    /// 2.4, 5 and 6 GHz, when the report carries a PHY.
+    pub bands: Option<[bool; 3]>,
+}
+
+impl Booted {
+    fn name(self) -> &'static str {
+        match self.chip {
+            Chip::Mt7921 => "MT7921",
+            Chip::Mt7922 => "MT7922",
+            Chip::Mt7925 => "MT7925",
+        }
+    }
+}
+
+impl fmt::Display for Booted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: firmware booted", self.name())?;
+        match self.address {
+            Some(Mac([a, b, c, d, e, g])) => write!(
+                f,
+                ", address {a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}"
+            )?,
+            None => f.write_str(", no address reported")?,
+        }
+        match self.bands {
+            Some([ghz2, ghz5, ghz6]) => write!(
+                f,
+                ", bands 2.4 GHz {}, 5 GHz {}, 6 GHz {}",
+                u8::from(ghz2),
+                u8::from(ghz5),
+                u8::from(ghz6)
+            )?,
+            None => f.write_str(", bands unreported")?,
+        }
+        f.write_str("; its station layer is not ported, so no Wi-Fi link starts")
+    }
+}
+
 impl From<bootstrap::Error> for AttachError {
     fn from(error: bootstrap::Error) -> Self {
         Self::Bootstrap(error)
@@ -82,6 +137,7 @@ impl From<bootstrap::Error> for AttachError {
 impl fmt::Display for AttachError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StationNotPorted(booted) => write!(f, "{booted}"),
             Self::Firmware(error) => write!(f, "{error}"),
             Self::Bootstrap(error) => write!(f, "{error}"),
             Self::Link(error) => write!(f, "{error}"),
@@ -121,8 +177,14 @@ pub unsafe fn attach<C: 'static>(
     domain: Arc<dyn DmaDomain>,
     inputs: Inputs,
 ) -> Result<Attached<C>, AttachError> {
-    if pci.chip() != Some(Chip::Mt7925) {
-        return Err(AttachError::UnsupportedChip(pci));
+    match pci.chip() {
+        Some(Chip::Mt7925) => {}
+        Some(Chip::Mt7921) => {
+            // SAFETY: forwarded from the caller.
+            let booted = unsafe { boot_only(pci, base, bytes, resource, domain, &inputs) }?;
+            return Err(AttachError::StationNotPorted(booted));
+        }
+        _ => return Err(AttachError::UnsupportedChip(pci)),
     }
     let alpha2 = inputs.network.country.unwrap_or(*b"00");
     let country = inputs
@@ -212,4 +274,109 @@ pub unsafe fn attach<C: 'static>(
         ),
         firmware_domain_unused,
     })
+}
+
+/// `mt7921_pci_probe` as far as the firmware's boot: identify the function,
+/// load both images, claim it, install its queues and boot, then read what
+/// the capability query reported. No CLC, regulatory, MAC or station command
+/// follows, because those are Connac3's here.
+///
+/// # Safety
+/// As for [`attach`].
+unsafe fn boot_only<C: 'static>(
+    pci: PciIdentity,
+    base: NonNull<u8>,
+    bytes: usize,
+    resource: Arc<C>,
+    domain: Arc<dyn DmaDomain>,
+    inputs: &Inputs,
+) -> Result<Booted, AttachError> {
+    let owner: Arc<dyn Any> = resource.clone();
+    // SAFETY: forwarded from the caller.
+    let identity =
+        unsafe { bootstrap::identify(pci, base, bytes, owner.clone(), inputs.clock, inputs.aspm) }?;
+    // Both images load before the controller claims the function.
+    let prepared = Requests::new(&identity)
+        .load(inputs.firmware)
+        .map_err(AttachError::Firmware)?;
+    let chip = identity.chip;
+    // SAFETY: forwarded from the caller.
+    let mut controller =
+        unsafe { Controller::new(identity, base, bytes, owner, resource, inputs.clock) }?;
+    // SAFETY: forwarded from the caller.
+    unsafe { controller.install(inputs.pages, domain, inputs.aspm) }?;
+    controller.boot(&prepared)?;
+    Ok(booted(chip, controller.capabilities()))
+}
+
+/// What the booted firmware's capability report says, unaltered: no
+/// address is invented when it carries none.
+fn booted(chip: Chip, report: Option<&CapabilityReport>) -> Booted {
+    let observed = report.map(CapabilityReport::observed);
+    Booted {
+        chip,
+        address: observed.and_then(|report| report.mac()),
+        bands: observed.and_then(|report| {
+            let phy = report.phy()?;
+            Some([
+                phy.has_2ghz(),
+                phy.has_5ghz(),
+                report.six_ghz().unwrap_or(false),
+            ])
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    #[test]
+    fn booted_function_reports_its_chip_address_and_bands() {
+        let booted = Booted {
+            chip: Chip::Mt7921,
+            address: Some(Mac([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e])),
+            bands: Some([true, true, false]),
+        };
+        assert_eq!(
+            AttachError::StationNotPorted(booted).to_string(),
+            "MT7921: firmware booted, address 00:1a:2b:3c:4d:5e, \
+             bands 2.4 GHz 1, 5 GHz 1, 6 GHz 0; \
+             its station layer is not ported, so no Wi-Fi link starts"
+        );
+    }
+
+    #[test]
+    fn booted_mt7921_model_reports_its_bands_and_invents_no_address() {
+        if crate::test_process::isolate_model() {
+            return;
+        }
+        let mut f = bootstrap::tests::NativeFixture::new(Chip::Mt7921);
+        f.install().unwrap();
+        f.boot(Chip::Mt7921);
+        // The model's capability payload names a PHY with 2.4 and 5 GHz and no
+        // station address; the readout passes exactly that through.
+        assert_eq!(
+            booted(Chip::Mt7921, f.controller.capabilities()),
+            Booted {
+                chip: Chip::Mt7921,
+                address: None,
+                bands: Some([true, true, false]),
+            }
+        );
+        f.retire();
+    }
+
+    #[test]
+    fn missing_observations_are_named_not_invented() {
+        let text = Booted {
+            chip: Chip::Mt7921,
+            address: None,
+            bands: None,
+        }
+        .to_string();
+        assert!(text.contains("no address reported"), "{text}");
+        assert!(text.contains("bands unreported"), "{text}");
+    }
 }

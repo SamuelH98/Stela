@@ -69,7 +69,8 @@ pub(super) enum Kind {
     Ish,
     /// An Intel Wi-Fi function, which `iwl_pci_probe` identifies further.
     IntelWifi,
-    /// A MediaTek Wi-Fi function; only MT7925 attaches.
+    /// A MediaTek Wi-Fi function; MT7925 attaches, and MT7921 boots its
+    /// firmware without a station.
     MediatekWifi,
     /// A Realtek Wi-Fi function; only RTL8822C attaches.
     RealtekWifi,
@@ -143,7 +144,7 @@ impl Kind {
             Self::Sfh => "AMD sensor hub",
             Self::Ish => "Intel sensor hub",
             Self::IntelWifi => "iwlwifi Wi-Fi (with --wifi)",
-            Self::MediatekWifi => "mt7925 Wi-Fi (with --wifi)",
+            Self::MediatekWifi => "mt792x Wi-Fi (with --wifi)",
             Self::RealtekWifi => "rtw88 Wi-Fi (with --wifi)",
             Self::IntelBluetooth => "Intel PCIe Bluetooth",
             Self::Bcm4377 => "bcm4377 Bluetooth",

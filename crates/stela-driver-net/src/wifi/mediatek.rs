@@ -5,7 +5,8 @@
 //!
 //! Exact identity, bounded firmware parsing and download are separate from
 //! PCI ownership, WFDMA transport, radio initialization and client association;
-//! [`attach`] composes them into an MT7925 station link.
+//! [`attach`] composes them into an MT7925 station link, and boots an MT7921's
+//! firmware without a station.
 pub mod acpi;
 pub mod attach;
 pub mod bootstrap;
