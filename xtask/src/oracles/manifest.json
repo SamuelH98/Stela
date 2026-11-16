@@ -94,6 +94,14 @@
   },
   {
     "package": "stela-compiler",
+    "test": "allocator_bound_census",
+    "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "system-mode and process-mode code of the blocks named by DENSITY_IN, for the allocator bound; run on request"
+  },
+  {
+    "package": "stela-compiler",
     "test": "region_census_of_real_code",
     "source": "crates/stela-compiler/src/x86_64/block/tests.rs",
     "kind": "manual",
@@ -4806,6 +4814,14 @@
   },
   {
     "package": "stela-engine",
+    "test": "miss_path_timing",
+    "source": "crates/stela-engine/src/machine/engine/pointer.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "PAC memo miss path timing and single-stepped host instruction counts; run on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "compile_bench",
     "source": "crates/stela-engine/src/machine/engine/stored/tests.rs",
     "kind": "manual",
@@ -4995,5 +5011,13 @@
     "kind": "manual",
     "inputs": [],
     "reason": "host timing of one native entry into a device site's stub and the return; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "paired_and_looked_up_return_costs",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/paired.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a guest call and return pair, through the return's lookup tail and paired; run on request"
   }
 ]

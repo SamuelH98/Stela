@@ -173,7 +173,15 @@ fn lines_show_shares_of_instructions_then_cycles() {
     let line = shares(&counts, &NAMES);
     assert_eq!(
         line,
-        " native=95.0/90.0 inline=75.0/60.0 pac-call=20.0/30.0 fetch=0.1/0.0 x:e=4.9/10.0"
+        " ins=0M cyc=0M nat_ins=0M nat_cyc=0M native=95.0/90.0 inline=75.0/60.0 \
+         pac-call=20.0/30.0 fetch=0.1/0.0 x:e=4.9/10.0"
     );
-    assert_eq!(shares(&[[0; SAMPLED]; CLASSES], &NAMES), " native=0.0/0.0");
+    assert_eq!(
+        shares(&[[0; SAMPLED]; CLASSES], &NAMES),
+        " ins=0M cyc=0M nat_ins=0M nat_cyc=0M native=0.0/0.0"
+    );
+    let mut counts: Counts = [[0; SAMPLED]; CLASSES];
+    counts[CodeRegion::Inline as usize] = [3_000_000, 5_000_000];
+    counts[HOST] = [1_000_000, 1_000_000];
+    assert!(shares(&counts, &NAMES).starts_with(" ins=6M cyc=4M nat_ins=5M nat_cyc=3M"));
 }

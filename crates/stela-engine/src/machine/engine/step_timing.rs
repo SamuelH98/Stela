@@ -6,6 +6,12 @@
 mod regions;
 pub use regions::{CodeRegion, block_regions, pointer_service_calls};
 
+/// Words of a PE's PAC census (`Statistics` `pac_census`): cipher runs by
+/// key (IA, IB, DA, DB, GA) and operation (signing, authentication,
+/// PACGA), then by cause (new, here, other), then those of native code,
+/// then new key generations.
+pub const PAC_CENSUS_WORDS: usize = super::pointer::census::WORDS;
+
 /// A phase of the step loop ([`super::Machine::run_blocks`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]

@@ -245,7 +245,9 @@ fn percent(share: u64, total: u64) -> String {
     format!("{}.{}", permille / 10, permille % 10)
 }
 
-/// The shares part of a `PES WHERE` line for `counts`: ` native=I/C`, then
+/// The shares part of a `PES WHERE` line for `counts`: the instructions and
+/// cycles the samples stand for, in all and in native code, in millions
+/// (` ins= cyc= nat_ins= nat_cyc=`), ` native=I/C`, then
 /// ` name=I/C` for each class that took at least 0.1% of the instructions
 /// or the cycles, in percent of each.
 pub fn shares(counts: &Counts, exit_names: &[&str; EXIT_SLOTS]) -> String {
@@ -256,9 +258,14 @@ pub fn shares(counts: &Counts, exit_names: &[&str; EXIT_SLOTS]) -> String {
             .map(|class| counts[class][counter])
             .sum::<u64>()
     });
-    // Counter 0 counts cycles, 1 instructions: instructions first.
+    // Counter 0 counts cycles, 1 instructions: instructions first. The
+    // events in millions: each sample weighs its period.
     let mut line = format!(
-        " native={}/{}",
+        " ins={}M cyc={}M nat_ins={}M nat_cyc={}M native={}/{}",
+        totals[1] / 1_000_000,
+        totals[0] / 1_000_000,
+        natives[1] / 1_000_000,
+        natives[0] / 1_000_000,
         percent(natives[1], totals[1]),
         percent(natives[0], totals[0])
     );

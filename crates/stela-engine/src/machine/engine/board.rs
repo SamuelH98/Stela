@@ -1022,7 +1022,18 @@ pub(super) struct Blocks {
     records: Records<Record>,
     /// Slots holding an installed block.
     live: AtomicUsize,
+    /// Advanced by every step that retires published blocks
+    /// ([`Self::advance_epoch`]): a paired frame holds it from its push,
+    /// and a return takes its continuation only while it is unchanged
+    /// (`chain::ChainControl::retire_epoch`), as the continuation may lie
+    /// in a block retired since. A line of its own: every PE's paired
+    /// returns read it.
+    epoch: RetireEpoch,
 }
+
+/// [`Blocks::epoch`].
+#[repr(align(64))]
+struct RetireEpoch(AtomicU64);
 
 impl Blocks {
     pub(super) fn new(capacity: u32) -> Self {
@@ -1030,7 +1041,27 @@ impl Blocks {
             slots: Slots::new(capacity),
             records: Records::new(capacity),
             live: AtomicUsize::new(0),
+            epoch: RetireEpoch(AtomicU64::new(1)),
         }
+    }
+
+    /// The host address of the retire epoch, which native code reads while
+    /// the board lives.
+    pub(super) fn epoch_address(&self) -> u64 {
+        self.epoch.0.as_ptr() as u64
+    }
+
+    /// The retire epoch now.
+    #[cfg(test)]
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch.0.load(Ordering::Relaxed)
+    }
+
+    /// Fail every paired frame pushed before now: before blocks that a
+    /// native run may have reached retire ([`Self::retire`]), so that a PE
+    /// whose frame names one sees the epoch moved at its return.
+    pub(super) fn advance_epoch(&self) {
+        self.epoch.0.fetch_add(1, Ordering::Release);
     }
 
     /// One more than the highest slot given so far.
@@ -1143,8 +1174,12 @@ impl Blocks {
     /// gives the records' memory back.
     pub(super) fn clear(&mut self, free: bool) {
         let capacity = self.slots.capacity;
+        // Every block goes: no frame of before may match.
+        self.advance_epoch();
         if free {
+            let epoch = self.epoch.0.load(Ordering::Relaxed);
             *self = Self::new(capacity);
+            *self.epoch.0.get_mut() = epoch;
         } else {
             self.slots = Slots::new(capacity);
             self.records.reset();

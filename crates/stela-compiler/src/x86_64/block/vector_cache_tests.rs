@@ -480,6 +480,9 @@ pub(super) mod faulting {
         "push r14",
         "push r15",
         "mov [rdx], rsp",
+        // Every exit reloads RSP from here (`chain::EXIT_RETURN`).
+        "lea r11, [rsp - 8]",
+        "mov [rdi + {exit_rsp}], r11",
         "call rsi",
         "pop r15",
         "pop r14",
@@ -499,6 +502,7 @@ pub(super) mod faulting {
         "pop rbp",
         "mov rax, -1",
         "ret",
+        exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
     );
     unsafe extern "sysv64" {
         fn stela_vreg_test_enter(state: *mut GuestState, code: usize, stack: *mut u64) -> u64;

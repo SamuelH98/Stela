@@ -33,6 +33,28 @@ pub(super) const EXIT_NAMES: [&str; step_timing::EXIT_SLOTS] = [
     "check-translated",
 ];
 
+/// `PES PAC` for the beat's cipher runs of every PE together
+/// (`step_timing::PAC_CENSUS_WORDS`): `fills=N` then each key's
+/// `KEY=S/A/G` signings, authentications and PACGAs, then the causes
+/// `new=` (no PE computed that result before, as far as the shared table
+/// remembers), `here=` (this PE did and its memo lost it), `other=` (another
+/// PE did), `native=F/C` (the runs from native code, and its calls of the
+/// service) and the new key generations `generations=`.
+fn pac_census_line(census: &[u64; step_timing::PAC_CENSUS_WORDS]) -> String {
+    const KEYS: [&str; 5] = ["ia", "ib", "da", "db", "ga"];
+    let fills: u64 = census[..KEYS.len() * 3].iter().sum();
+    let mut line = format!("PES PAC fills={fills}");
+    for (key, [signed, authenticated, generic]) in KEYS.iter().zip(census.as_chunks::<3>().0) {
+        line.push_str(&format!(" {key}={signed}/{authenticated}/{generic}"));
+    }
+    let causes = &census[KEYS.len() * 3..];
+    line.push_str(&format!(
+        " new={} here={} other={} native={}/{} generations={}",
+        causes[0], causes[1], causes[2], causes[3], causes[4], causes[5]
+    ));
+    line
+}
+
 /// `--profile`'s heartbeat lines: of `elapsed` ticks, the share inside the
 /// engine (`sliced`) and in each of its phases, the rest of the engine's
 /// time unattributed, and each exit kind's count, share and mean cost.
@@ -1964,7 +1986,11 @@ impl Heartbeat {
             ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
+            // All PEs: paired returns matched and missed, and calls past
+            // the frame bound (`chain::PairCount`).
+            let mut pairs = [0u64; stela_compiler::x86_64::chain::PAIR_COUNTS];
             let mut pac_fills = 0;
+            let mut pac_census = [0u64; step_timing::PAC_CENSUS_WORDS];
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
                 line.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.iter().zip(before).enumerate() {
@@ -2126,7 +2152,18 @@ impl Heartbeat {
                 ));
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                for (total, (now, before)) in
+                    pairs.iter_mut().zip(now.pairs.iter().zip(&before.pairs))
+                {
+                    *total += now.saturating_sub(*before);
+                }
                 pac_fills += now.pac_fills.saturating_sub(before.pac_fills);
+                for (sum, (now, before)) in pac_census
+                    .iter_mut()
+                    .zip(now.pac_census.iter().zip(&before.pac_census))
+                {
+                    *sum += now.saturating_sub(*before);
+                }
                 deltas(
                     &mut store,
                     pe,
@@ -2315,7 +2352,12 @@ impl Heartbeat {
                 ));
             }
             output::arguments(format_args!("{store}\n"));
+            if machine.step_timing().is_some() {
+                output::arguments(format_args!("{}\n", pac_census_line(&pac_census)));
+            }
             stamped.push_str(&format!(" in_use={stamped_in_use}"));
+            let [matched, missed, refused] = pairs;
+            stamped.push_str(&format!(" pairs={matched}/{missed}/{refused}"));
             stamped_line = Some((stamped, predicted, pac_fills));
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{phases}\n"));

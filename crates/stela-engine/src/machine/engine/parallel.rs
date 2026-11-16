@@ -598,8 +598,12 @@ pub struct Counts {
     /// the PAC branch exits it gave a predicted tail and its probe
     /// transfers ([`super::Statistics::lookup_hits`]).
     pub stamped: [u64; chain::STAMP_COUNTS + 4],
+    /// What its paired frames did since boot ([`chain::PairCount`]'s order).
+    pub pairs: [u64; chain::PAIR_COUNTS],
     /// PAC results its service computed since boot, each a memo miss.
     pub pac_fills: u64,
+    /// Its PAC census under step timing ([`step_timing::PAC_CENSUS_WORDS`]).
+    pub pac_census: [u64; step_timing::PAC_CENSUS_WORDS],
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
     /// step timing is enabled.
     pub phases: [u64; step_timing::Phase::COUNT],
@@ -2659,7 +2663,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 stamped[chain::STAMP_COUNTS + 3] = statistics.lookup_hits;
                 stamped
             },
+            pairs: self.chain.pairs(),
             pac_fills: self.pointer.fills,
+            pac_census: self
+                .pointer
+                .census
+                .as_ref()
+                .map_or([0; step_timing::PAC_CENSUS_WORDS], |census| census.words()),
             phases: self
                 .step_timing
                 .as_ref()

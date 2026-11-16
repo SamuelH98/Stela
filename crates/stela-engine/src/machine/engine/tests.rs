@@ -2558,6 +2558,49 @@ fn a_fetch_that_reclaims_code_forgets_the_lookup_entries_of_its_blocks_alone() {
 /// The page of an evicted block keeps its other blocks, whose links into it
 /// are undone: their exits there return to the engine again.
 #[test]
+fn retirements_and_invalidations_fail_every_paired_frame() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const RET: u32 = 0xd65f_03c0;
+    let mut words = vec![RET; 2 * FETCH_PAGE as usize / 4];
+    words[..5].copy_from_slice(&[ADD, 0x1400_0002, 0, ADD, 0x17ff_fffc]);
+    let mut machine = machine(&words);
+    machine.host.ring = Some(1);
+    let base = machine.cpu.pc;
+    let direct = |next_pc| NativeExit::Exit {
+        next_pc,
+        kind: ExitKind::Direct as u64,
+    };
+    // Each block of the page links into the other.
+    machine.host.exits = vec![direct(base + 12), direct(base), direct(base + 12)];
+    for _ in 0..3 {
+        machine.step().unwrap();
+    }
+    // Every native run may push frames, checked against the board's epoch.
+    let control = machine.chain.snapshot();
+    assert_eq!(
+        (control.frame_room as usize, control.retire_epoch),
+        (
+            chain::DEFAULT_FRAME_BOUND as usize * chain::FRAME_BYTES,
+            machine.code.blocks.epoch_address(),
+        )
+    );
+    // A retirement moves the epoch before its blocks retire.
+    let before = machine.code.blocks.epoch();
+    assert!(machine.fetch_block(base + FETCH_PAGE, false).is_ok());
+    assert_eq!(machine.statistics.code_evictions, 1);
+    let retired = machine.code.blocks.epoch();
+    assert!(retired > before);
+    // So does an IC IVAU of a page whose blocks a frame may name.
+    let index = machine.code.blocks.len() - 1;
+    let physical = machine.code.blocks[index].physical;
+    machine.invalidate_code_page(physical);
+    assert!(machine.code.blocks.epoch() > retired);
+    // Without a board epoch no frame is pushed.
+    machine.chain.set_frames(chain::DEFAULT_FRAME_BOUND, 0);
+    assert_eq!(machine.chain.snapshot().frame_room, 0);
+}
+
+#[test]
 fn eviction_undoes_the_links_into_evicted_blocks_and_keeps_their_pages() {
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
     const RET: u32 = 0xd65f_03c0;
@@ -3353,7 +3396,8 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
                 .unwrap()
                 .to_vec()
         } else {
-            chain::lookup_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64, 0)
+            // A return's tail first takes its call's paired frame.
+            chain::paired_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64)
                 .unwrap()
                 .to_vec()
         };
@@ -7057,14 +7101,15 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         + 1;
     let at = at * NATIVE_CODE_STRIDE;
     let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
-    // The probes, then the RET's own tail, which calls the table probe.
+    // The probes, then the RET's own tail, which takes its call's paired
+    // frame with the authenticated target or calls the table probe.
     let installed = machine.host.installed.len();
     let dispatcher = chain::lookup_dispatcher(0).unwrap();
     assert_eq!(machine.host.installed[installed - 2], dispatcher);
     let probes = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let tail = (installed * NATIVE_CODE_STRIDE) as u64;
     let probe = probes + chain::PROBE_ENTRY as u64;
-    let code = chain::lookup_tail(tail, ExitKind::Return, 1, probe, 0).unwrap();
+    let code = chain::paired_tail(tail, ExitKind::Return, 1, probe).unwrap();
     let exit = chain::jump(site, tail).unwrap();
     let patches = machine.host.patches.len();
     assert_eq!(

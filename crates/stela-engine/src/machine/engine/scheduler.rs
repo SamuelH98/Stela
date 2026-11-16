@@ -299,6 +299,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // Whether a transition may continue in this run, logged where
         // counters tell the levels apart (`transitions`).
         self.mirrors.transitions.chain = self.transition_chain();
+        self.chain
+            .set_frames(self.frame_bound, self.code.blocks.epoch_address());
         self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
@@ -915,15 +917,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !chain::patchable(site) {
             return false;
         }
-        let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, chain::LOOKUP_TAIL_BYTES)
-        else {
+        // A return's tail first takes its call's paired frame.
+        let returning = word.kind == ExitKind::Return && btype == 0;
+        let bytes = match returning {
+            true => chain::PAIRED_TAIL_BYTES,
+            false => chain::LOOKUP_TAIL_BYTES,
+        };
+        let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, bytes) else {
             return false;
         };
         let at = tail.0 as u64;
-        let (Some(code), Some(jump)) = (
-            chain::lookup_tail(at, word, retired, probe + chain::PROBE_ENTRY as u64, btype),
-            chain::jump(site, at),
-        ) else {
+        let probe = probe + chain::PROBE_ENTRY as u64;
+        let code = match returning {
+            true => chain::paired_tail(at, word, retired, probe).map(|code| code.to_vec()),
+            false => chain::lookup_tail(at, word, retired, probe, btype).map(|code| code.to_vec()),
+        };
+        let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
             return false;
         };
         self.patch_native(tail, &code);
@@ -1087,10 +1096,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let Some(arena) = &code.arena else {
             let probe = self.lookup_dispatcher(btype)?;
-            let tail = self
-                .host
-                .install(&[0; chain::STAMPED_TAIL_BYTES][..bytes])
-                .ok()?;
+            let tail = self.host.install(&[0; chain::TAIL_ROOM][..bytes]).ok()?;
             return Some((probe, tail));
         };
         // In the generation of the exit's block, which the tail outlives
@@ -1098,7 +1104,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let stream = self.stream_at(site);
         self.install_stream = stream;
         let tail = self
-            .install_native(&[0; chain::STAMPED_TAIL_BYTES][..bytes], false)
+            .install_native(&[0; chain::TAIL_ROOM][..bytes], false)
             .ok()?;
         // The tail's part was chosen meanwhile: the exit stays as it is.
         if !self.note_reference(site, tail.0 as u64) {

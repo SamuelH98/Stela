@@ -39,7 +39,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering::Relaxed};
 use stela_boot_core::host_samples::{
-    CLASSES, Counts, NativeSample, OUTSIDE, PENDING, SAMPLED, Tags, charged, shares,
+    CLASSES, Counts, NativeSample, OUTSIDE, PENDING, SAMPLED, Tags, charged, native, shares,
 };
 use stela_engine::machine::engine::step_timing::{self, CodeRegion, Phase};
 
@@ -61,6 +61,9 @@ const TOP: u64 = 1 << 47;
 const MAX_CORES: usize = 256;
 const LVT_PERFORMANCE: u32 = 0x340;
 const LVT_NMI: u32 = 4 << 8;
+/// TSC ticks between two looks for an overflow whose NMI never came: about
+/// a second.
+const LOST_CHECK_TICKS: u64 = 1 << 32;
 /// The longest PAC service call end kept.
 const CALL_END_BYTES: usize = 16;
 
@@ -111,8 +114,10 @@ struct Sampler {
     arena: Option<Tags>,
     /// The PAC service's call ends ([`step_timing::pointer_service_calls`]).
     service_calls: [([u8; CALL_END_BYTES], usize); 2],
-    /// Overflows charges found no NMI for, and reloaded.
+    /// Overflows found with no NMI, and reloaded, and the TSC at the last
+    /// look ([`host_service`]).
     lost: AtomicU64,
+    checked: AtomicU64,
 }
 
 static CORES: [AtomicPtr<Sampler>; MAX_CORES] =
@@ -217,6 +222,7 @@ pub(super) fn start(pe: usize, counters: [u32; SAMPLED], clear: Option<u32>, rea
         arena: Tags::new(state.code_virtual, state.code_bytes),
         service_calls,
         lost: AtomicU64::new(0),
+        checked: AtomicU64::new(0),
     });
     for counter in 0..SAMPLED {
         sampler.period[counter].store(period, Relaxed);
@@ -412,7 +418,14 @@ pub(crate) fn host_service() {
     if sampler.sampled.load(Relaxed) {
         charge_to(sampler, None, None);
     }
-    // An overflow whose NMI never came would stop sampling.
+    // An overflow whose NMI never came would stop sampling: look once in
+    // LOST_CHECK_TICKS, as each RDPMC may trap, and count the reads in the
+    // overhead.
+    let now = crate::apic::rdtsc();
+    if now.wrapping_sub(sampler.checked.load(Relaxed)) < LOST_CHECK_TICKS {
+        return;
+    }
+    sampler.checked.store(now, Relaxed);
     for counter in 0..SAMPLED {
         let value = rdpmc(counter as u32);
         if value & TOP == 0 && value & MASK > sampler.armed[counter].load(Relaxed) {
@@ -420,6 +433,7 @@ pub(crate) fn host_service() {
             sampler.reload(counter);
         }
     }
+    add(&sampler.spent, crate::apic::rdtsc().wrapping_sub(now));
 }
 
 /// The engine installed `bytes` of code at `code` as `regions`
@@ -454,6 +468,39 @@ impl Seen {
             at: 0,
         }
     }
+}
+
+/// The share of `pe`'s cycles and of its instructions native code took
+/// since the last `PES WHERE` line, in parts per million, from its samples;
+/// `None` without samples. `PES PMU` scales its whole-PE counts by it where
+/// no window measured native code alone ([`super::pmu::report`]).
+pub(crate) fn native_share(seen: &Seen, pe: usize) -> Option<[u64; SAMPLED]> {
+    let sampler = CORES.iter().find_map(|slot| {
+        let pointer = slot.load(Relaxed);
+        // SAFETY: leaked at `start`, never freed.
+        (!pointer.is_null())
+            .then(|| unsafe { &*pointer })
+            .filter(|sampler| sampler.pe == pe)
+    })?;
+    let mut share = [0; SAMPLED];
+    for (counter, share) in share.iter_mut().enumerate() {
+        let (mut all, mut natives) = (0u64, 0u64);
+        for class in 0..CLASSES {
+            let before = seen
+                .counts
+                .get(pe)
+                .map_or(0, |counts| counts[class][counter]);
+            let events = sampler.counts[class][counter]
+                .load(Relaxed)
+                .wrapping_sub(before);
+            all += events;
+            if native(class) {
+                natives += events;
+            }
+        }
+        *share = (u128::from(natives) * 1_000_000).checked_div(u128::from(all))? as u64;
+    }
+    Some(share)
 }
 
 /// The `PES WHERE` lines for the beat that ends now: one per sampling PE,

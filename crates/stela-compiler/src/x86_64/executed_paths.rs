@@ -383,3 +383,63 @@ fn inline_end(body: &[u8], last: usize) -> usize {
     }
     body.len()
 }
+
+/// What the value allocator would save system-mode blocks, run by hand:
+/// each block of `DENSITY_IN` compiled as a system-mode block (pinned set,
+/// fault table, no regions) into `DENSITY_OUT`, and as a process block
+/// (regions and the value allocator over all twelve hosts, no pinned set
+/// or fault table) into `DENSITY_OUT.process`, in `density_dump`'s format
+/// (`pc weight source-bytes hex-code pc:offset,...`). The process code
+/// bounds what an unconstrained allocator (variant C, before recovery
+/// rows) can reach on the same instructions.
+#[test]
+#[ignore = "manual: opt-in"]
+fn allocator_bound_census() {
+    use std::io::Write;
+    let input = std::env::var("DENSITY_IN").expect("DENSITY_IN names the sample");
+    let output = std::env::var("DENSITY_OUT").expect("DENSITY_OUT names the output");
+    let process = Options::new(
+        BlockProfile::new(Features::POINTER_AUTHENTICATION),
+        TargetCpu::detect(),
+    );
+    for (options, path) in [(options(), output.clone()), (process, output + ".process")] {
+        let mut out = std::fs::File::create(path).expect("the output");
+        for line in std::fs::read_to_string(&input).expect("the sample").lines() {
+            let mut fields = line.split(' ');
+            let (Some(pc), Some(weight), Some(hex)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let pc = u64::from_str_radix(pc, 16).unwrap();
+            let source: Vec<u8> = (0..hex.len() / 2)
+                .map(|at| u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).unwrap())
+                .collect();
+            let compiled = CompilationPlan::new(&source, GuestAddress(pc), &options)
+                .ok()
+                .and_then(|plan| plan.compile().ok());
+            let Some(compiled) = compiled else {
+                writeln!(out, "{pc:x} {weight} refused").unwrap();
+                continue;
+            };
+            let code: String = compiled
+                .native
+                .x86_64_code
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let map: Vec<String> = compiled
+                .native
+                .source_map
+                .iter()
+                .map(|(pc, offset)| format!("{:x}:{offset}", pc.0))
+                .collect();
+            writeln!(
+                out,
+                "{pc:x} {weight} {} {code} {}",
+                compiled.source_bytes,
+                map.join(",")
+            )
+            .unwrap();
+        }
+    }
+}

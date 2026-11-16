@@ -20,12 +20,13 @@
 //!
 //! Live code changes only at patch points, each one instruction of
 //! [`PATCH_BYTES`] that lies in one aligned 8-byte word ([`patchable`]):
-//! the `ret` of an exit ([`direct_patch`], [`dynamic_patch`]) and the start
+//! the point of an exit ([`direct_patch`], [`dynamic_patch`]) and the start
 //! of a link slot ([`slot_patch`]). Another core may be running the
 //! instruction, so the host replaces it with one aligned 8-byte store, and
 //! the core runs either the old instruction or the new one, each complete:
-//! `ret` or a `jmp rel32` to a thunk or tail at an exit, a jump to the exit
-//! or [`NOP5`] into the slot's body at a slot. Whatever a new instruction
+//! the jump to the exit's return to the engine ([`RET_ROOM`]) or a
+//! `jmp rel32` to a thunk or tail at an exit, a jump to the exit or
+//! [`NOP5`] into the slot's body at a slot. Whatever a new instruction
 //! reaches is written, and serialized by the writer, before the store: a
 //! thunk or tail in fresh arena bytes, or a slot's body, which nothing runs
 //! while its point still jumps over it. A body once linked is not written
@@ -64,6 +65,14 @@
 //! or BLR) also requires the entry to accept that BTYPE
 //! (`LookupEntry::targets`), as a Branch Target check of the entered
 //! block's first instruction would.
+//!
+//! Every return to the engine reloads RSP from the state's saved entry
+//! stack pointer first ([`EXIT_RETURN`]), so native code may leave words
+//! on the host stack between blocks: a guest call pushes a paired frame
+//! and calls its own exit ([`paired_call`]), and the return whose target
+//! and contexts are the frame's takes a host `ret` into the call's
+//! continuation ([`paired_return`], [`paired_tail`]), which the CPU's
+//! return predictor serves, instead of a probe and an indirect jump.
 use crate::x86_64::asm::{
     Alu, BitTest, Code, Cond,
     Gpr::{self, R8, R9, R10, R11, Rax, Rcx, Rdx},
@@ -95,8 +104,9 @@ const MAX_PAD: usize = 4;
 /// Bytes of a [`link`]'s body, without and with the interruption gate.
 pub const LINK_BODY_BYTES: usize = 34;
 pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 10;
-/// Bytes in the largest [`thunk`]: the body and a return's `mov edx; ret`.
-pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + 6;
+/// Bytes in the largest [`thunk`]: the body and a return's `mov edx` and
+/// [`EXIT_RETURN`].
+pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + 5 + EXIT_RETURN_BYTES;
 /// Bytes of the link slot before an exit in its page ([`link_slot`]): the
 /// pad, the patch point and the body, without and with the gate.
 pub const LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + LINK_BODY_BYTES;
@@ -104,11 +114,33 @@ pub const POLLED_LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + POLLED_LINK_BODY_BY
 /// The span within which a link needs no translation of its own.
 const LINK_PAGE: u64 = 4096;
 /// Bytes in an exit to a dynamic target in RAX: `mov edx, kind`, a pad,
-/// then the patch point `ret` with room for a `jmp rel32`
-/// ([`dynamic_patch`]).
-pub const DYNAMIC_EXIT_BYTES: usize = 5 + MAX_PAD + PATCH_BYTES;
-/// An unlinked exit's patch point: `ret` and the room a jump takes.
-pub const RET_ROOM: [u8; PATCH_BYTES] = [0xc3, 0xcc, 0xcc, 0xcc, 0xcc];
+/// then the patch point, a `jmp rel32` ([`dynamic_patch`]), and the
+/// [`EXIT_RETURN`] it falls into while unlinked.
+pub const DYNAMIC_EXIT_BYTES: usize = 5 + MAX_PAD + PATCH_BYTES + EXIT_RETURN_BYTES;
+/// [`crate::GuestState::exit_rsp`], from RDI.
+pub const EXIT_RSP_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, exit_rsp) as i32;
+/// Bytes of [`EXIT_RETURN`].
+pub const EXIT_RETURN_BYTES: usize = 8;
+/// Every return of native code to the engine: `mov rsp, [rdi + exit_rsp]`
+/// and `ret`. RSP is then where the entry's `call` left it, whatever words
+/// native code left on the host stack since, so the `ret` reaches the
+/// entry.
+pub const EXIT_RETURN: [u8; EXIT_RETURN_BYTES] = {
+    let d = EXIT_RSP_OFFSET.to_le_bytes();
+    [0x48, 0x8b, 0xa7, d[0], d[1], d[2], d[3], 0xc3]
+};
+/// What an entry runs right before it calls native code (RSP 8 bytes above
+/// where the `call` leaves it, RDI at the state): `lea r11, [rsp - 8]` and
+/// `mov [rdi + exit_rsp], r11`.
+pub const EXIT_RSP_STORE: [u8; 12] = {
+    let d = EXIT_RSP_OFFSET.to_le_bytes();
+    [
+        0x4c, 0x8d, 0x5c, 0x24, 0xf8, 0x4c, 0x89, 0x9f, d[0], d[1], d[2], d[3],
+    ]
+};
+/// An unlinked exit's patch point: a `jmp rel32` to the [`EXIT_RETURN`]
+/// right after it.
+pub const RET_ROOM: [u8; PATCH_BYTES] = [0xe9, 0, 0, 0, 0];
 /// A linked slot's patch point: the 5-byte NOP that falls into its body.
 pub const NOP5: [u8; PATCH_BYTES] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
 /// The bits of a PC above which [`lookup_slot`] folds the next ones in:
@@ -297,13 +329,69 @@ pub struct ChainControl {
     /// skipped): the engine's counts, which only those exits write.
     pub loop_entries: u64,
     pub loop_iterated: u64,
+    /// The most bytes of paired frames ([`paired_call`]) one native run
+    /// keeps on the host stack below the entry's: 0 pushes none, and a call
+    /// that would go past it takes the plain exit.
+    pub frame_room: u32,
+    /// Native code neither reads nor writes it.
+    pub reserved: u32,
+    /// The host address of the board's retire epoch, which every step that
+    /// retires blocks advances, or 0 with `frame_room` 0. A frame holds
+    /// the epoch of its push; a return takes it only while the epoch is
+    /// unchanged, as its continuation may lie in a block retired since.
+    pub retire_epoch: u64,
+    /// What paired frames did ([`PairCount`]): native code's counts, which
+    /// only grow.
+    pub pairs: [u64; PAIR_COUNTS],
 }
+
+/// The counts of [`ChainControl::pairs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairCount {
+    /// Returns that took their frame's continuation.
+    Matched,
+    /// Returns with frames on the stack that took the exit's lookup.
+    Missed,
+    /// Calls past the frame bound, which took the plain exit.
+    Refused,
+}
+
+/// Entries of [`ChainControl::pairs`].
+pub const PAIR_COUNTS: usize = 3;
+
+impl PairCount {
+    const fn offset(self) -> i32 {
+        PAIRS + 8 * self as i32
+    }
+}
+
+/// The paired frames the engine lets one native run keep by default
+/// ([`ChainControl::frame_room`]).
+pub const DEFAULT_FRAME_BOUND: u32 = 64;
+/// Bytes of one paired frame on the host stack, from the top of the stack
+/// down: the host return address, the guest return address, the calling
+/// block's word, the retire epoch and the lower and upper half's contexts
+/// ([`FrameWord`]). A multiple of 16, so code between blocks keeps its
+/// stack alignment.
+pub const FRAME_BYTES: usize = 48;
+
+/// The words of a paired frame above its host return address, by their
+/// offset from RSP while the return address is on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameWord {
+    Address = 8,
+    Block = 16,
+    Epoch = 24,
+    LowerContext = 32,
+    UpperContext = 40,
+}
+const _: () = assert!(FrameWord::UpperContext as usize + 8 == FRAME_BYTES);
 
 // Epoch and observed state are naturally aligned atomic-width words. Capture
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 144);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 184);
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -1788,6 +1876,9 @@ const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
 const OBSERVED_INTERRUPT_EPOCH: i32 =
     core::mem::offset_of!(ChainControl, observed_interrupt_epoch) as i32;
+const FRAME_ROOM: i32 = core::mem::offset_of!(ChainControl, frame_room) as i32;
+const RETIRE_EPOCH: i32 = core::mem::offset_of!(ChainControl, retire_epoch) as i32;
+const PAIRS: i32 = core::mem::offset_of!(ChainControl, pairs) as i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interruption {
@@ -1912,8 +2003,8 @@ fn direct_exit_padded(target: GuestAddress, word: u32, pad: usize) -> [u8; DIREC
     bytes
 }
 
-/// MOV EDX with `word`, a NOP of `pad` bytes, then the patch point: RET
-/// and the room a jump takes, INT3s to the exit's end
+/// MOV EDX with `word`, a NOP of `pad` bytes, then the patch point, which
+/// jumps to the [`EXIT_RETURN`] right after it, and INT3s to the exit's end
 /// ([`super::block::exit_kind_with`]).
 fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
     const MOV_EDX: u8 = 0xba;
@@ -1921,8 +2012,22 @@ fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
     bytes[0] = MOV_EDX;
     bytes[1..5].copy_from_slice(&word.to_le_bytes());
     bytes[5..5 + pad].copy_from_slice(NOPS[pad]);
-    bytes[5 + pad..5 + pad + PATCH_BYTES].copy_from_slice(&RET_ROOM);
+    let point = 5 + pad;
+    bytes[point..point + PATCH_BYTES].copy_from_slice(&RET_ROOM);
+    let back = point + PATCH_BYTES;
+    bytes[back..back + EXIT_RETURN_BYTES].copy_from_slice(&EXIT_RETURN);
     bytes
+}
+
+/// The unpadded dynamic exit of the encoded `word` ([`ExitWord::encoded`]).
+#[cfg(test)]
+pub(crate) fn exit_word(word: u32) -> [u8; DYNAMIC_EXIT_BYTES] {
+    exit_word_bytes(word, 0)
+}
+
+/// The return to the engine ([`EXIT_RETURN`]).
+pub(crate) fn exit_return(asm: &mut crate::x86_64::asm::Asm) {
+    asm.fixed(&EXIT_RETURN);
 }
 
 /// The NOP of each length up to [`MAX_PAD`] (Intel SDM vol. 2, NOP).
@@ -2255,7 +2360,7 @@ fn link_body(
         Fall::Thunk(Fallback::Return(word)) => {
             let mut asm = code.asm();
             asm.mov_imm32(Rdx, word.encoded());
-            asm.ret();
+            exit_return(&mut asm);
             body
         }
         Fall::Thunk(Fallback::Jump(exit)) => {
@@ -2272,6 +2377,132 @@ fn link_body(
     }
     code.patch(transfer.offset(), distance.to_le_bytes());
     Some(code.into_bytes())
+}
+
+/// The start of a call whose guest return address is `return_address`,
+/// in code that RCX, R8 and flags are free in (RAX may hold the call's
+/// target, RDX its word), before its exit: unless the frames already below
+/// the entry's stack fill the control's room, a paired frame
+/// ([`FRAME_BYTES`]) and a host `call` of the exit that follows, whose
+/// return comes back to a jump to the call's continuation. The frame holds
+/// `return_address`, the calling block's word, the board's retire epoch
+/// and both halves' contexts, under the call's own return address, so a
+/// guest return to `return_address` in this native run, in the same
+/// contexts, can `ret` into the continuation ([`paired_return`]). The
+/// continuation is the caller's own exit to `return_address`, which runs
+/// none of the block's instructions: the call's exit counted them. A call
+/// past the room counts its refusal and takes the exit as a plain one;
+/// code run without a control pushes none.
+///
+/// Between blocks the host stack holds paired frames and nothing else, from
+/// the state's saved entry stack pointer down ([`EXIT_RETURN`]): every
+/// block, thunk and tail leaves RSP as it found it but for these. A run
+/// that leaves native code at any exit leaves every frame with it, as the
+/// exit reloads RSP: an exit the called code takes before its return, or
+/// the call's own exit while unlinked, discards the frames whole. The jump
+/// to the continuation is the patch this returns, which the caller binds
+/// after the call's exit.
+pub(crate) fn paired_call(
+    asm: &mut crate::x86_64::asm::Asm,
+    return_address: GuestAddress,
+) -> crate::x86_64::asm::Patch {
+    asm.place(Rcx, CONTROL);
+    asm.test(Qword, Rcx, Rcx);
+    let uncontrolled = asm.jcc(Cond::E);
+    // R8 = the bytes of frames below the entry's stack now.
+    asm.mov_load(Qword, R8, Mem::base(Gpr::Rdi, EXIT_RSP_OFFSET));
+    asm.alu(Alu::Sub, Qword, R8, Gpr::Rsp);
+    asm.alu_load(Alu::Cmp, Dword, R8, Mem::base(Rcx, FRAME_ROOM));
+    let refused = asm.jcc(Cond::Ae);
+    asm.push_rm(Mem::base(Rcx, CONTEXTS + 8));
+    asm.push_rm(Mem::base(Rcx, CONTEXTS));
+    asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
+    asm.push_rm(Mem::base(R8, 0));
+    asm.push_rm(Mem::base(Rcx, BLOCK));
+    asm.guest_imm64(R8, return_address);
+    asm.push(R8);
+    let call = asm.call();
+    let continuation = asm.jmp();
+    asm.bind(refused);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Refused.offset()),
+        1,
+    );
+    asm.bind(call);
+    asm.bind(uncontrolled);
+    continuation
+}
+
+/// The start of a return to the target in RAX, from a block that ran `ran`
+/// instructions, in code that RCX, R8 and flags are free in, before its
+/// lookup: when the host stack holds a frame ([`paired_call`]), which it
+/// does below the entry's stack pointer, and that frame holds the target,
+/// the board's retire epoch has not moved since its push, both halves'
+/// contexts are the frame's, no interruption is pending and budget is
+/// left, the return counts `ran`, names the calling block again and
+/// `ret`s into the frame's continuation, taking the frame. Anything else
+/// goes on to the lookup, its frames left in place.
+///
+/// A frame's continuation is an exit to its address from a block that ran
+/// in the frame's contexts, so any return to that address in those
+/// contexts in the same native run may take it, whichever call pushed it:
+/// in one run the PE's ITLB changes only by contexts (a native SVC, ERET
+/// or exception entry loads another state's), and a TLBI, a TTBR or
+/// translation control write and every fill leave native code, which
+/// discards the frames. A block retired meanwhile, by any PE, advances
+/// the epoch, which every frame of the run then fails, so a return never
+/// enters a retired block's continuation through its frame.
+pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<()> {
+    let ran = i32::try_from(ran).ok()?;
+    let frame = |word: FrameWord| Mem::base(Gpr::Rsp, word as i32);
+    asm.alu_load(
+        Alu::Cmp,
+        Qword,
+        Gpr::Rsp,
+        Mem::base(Gpr::Rdi, EXIT_RSP_OFFSET),
+    );
+    let empty = asm.jcc8(Cond::E);
+    asm.place(Rcx, CONTROL);
+    let mut misses = Vec::new();
+    asm.alu_load(Alu::Cmp, Qword, Rax, frame(FrameWord::Address));
+    misses.push(asm.jcc8(Cond::Ne));
+    asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
+    asm.mov_load(Qword, R8, Mem::base(R8, 0));
+    asm.alu_load(Alu::Cmp, Qword, R8, frame(FrameWord::Epoch));
+    misses.push(asm.jcc8(Cond::Ne));
+    for (half, word) in [(0, FrameWord::LowerContext), (1, FrameWord::UpperContext)] {
+        asm.mov_load(Qword, R8, Mem::base(Rcx, CONTEXTS + 8 * half));
+        asm.alu_load(Alu::Cmp, Qword, R8, frame(word));
+        misses.push(asm.jcc8(Cond::Ne));
+    }
+    misses.extend(interruption_gate(asm, Interruption::Epoch, R8));
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    misses.push(asm.jcc8(Cond::E));
+    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran);
+    // The block's index, entered with BTYPE 0 as a continuation is.
+    asm.mov_load(Dword, R8, frame(FrameWord::Block));
+    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Matched.offset()),
+        1,
+    );
+    // ret 40: into the continuation, the rest of the frame taken.
+    asm.fixed(&[0xc2, (FRAME_BYTES - 8) as u8, 0]);
+    for miss in misses {
+        asm.bind(miss);
+    }
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Missed.offset()),
+        1,
+    );
+    asm.bind(empty);
+    Some(())
 }
 
 /// Bytes of the cell probe of a [`lookup_dispatcher`], which comes first.
@@ -2689,7 +2920,7 @@ fn stamped_with_policy(
     let mut asm = code.asm();
     asm.bind(exhausted);
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    asm.ret();
+    exit_return(&mut asm);
     // A miss counts its cause and takes the cell tail.
     let mut to_tail = Vec::new();
     for (miss, count) in [
@@ -2825,7 +3056,7 @@ fn found(asm: &mut crate::x86_64::asm::Asm) {
 /// A probe's exit to the engine, with RAX and EDX as the tail left them: the
 /// return of the native run, as the tail jumped to the probe.
 fn missed(asm: &mut crate::x86_64::asm::Asm) {
-    asm.ret();
+    exit_return(asm);
 }
 
 /// Bytes in a [`lookup_tail`]: the jump cache's hit, its exhausted
@@ -2872,11 +3103,71 @@ fn lookup_tail_with_policy(
     btype: u8,
     policy: Interruption,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
+    let mut code = Code::new();
+    lookup_tail_code(&mut code, at, word, ran, probe, btype, policy)?;
+    let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    code.try_into().ok()
+}
+
+/// Bytes in a [`paired_tail`], padded.
+pub const PAIRED_TAIL_BYTES: usize = 256;
+/// Bytes of the largest tail the engine installs where a lookup tail or a
+/// stamped one may go.
+pub const TAIL_ROOM: usize = if STAMPED_TAIL_BYTES > PAIRED_TAIL_BYTES {
+    STAMPED_TAIL_BYTES
+} else {
+    PAIRED_TAIL_BYTES
+};
+
+/// The tail at host address `at` of a return's exit: a [`lookup_tail`]
+/// whose return first takes the frame of its call when that frame holds
+/// the target in the contexts it was pushed in ([`paired_return`]), where
+/// the block of `ran` instructions it leaves is counted as the lookup
+/// would. Every RET form's exit is one, RETA*'s after its thunk
+/// authenticated the target, so a forged or stale-key address, which the
+/// thunk leaves poisoned, never equals a frame's. `None` as for a
+/// [`lookup_tail`].
+pub fn paired_tail(
+    at: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<[u8; PAIRED_TAIL_BYTES]> {
+    let mut code = Code::new();
+    paired_return(&mut code.asm(), ran)?;
+    lookup_tail_code(
+        &mut code,
+        at,
+        word.into(),
+        ran,
+        probe,
+        0,
+        Interruption::Epoch,
+    )?;
+    let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    code.try_into().ok()
+}
+
+/// [`lookup_tail`]'s code, appended to `code`, which runs from `at`.
+fn lookup_tail_code(
+    code: &mut Code,
+    at: u64,
+    word: ExitWord,
+    ran: u32,
+    probe: u64,
+    btype: u8,
+    policy: Interruption,
+) -> Option<()> {
     if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
     }
     let entry = |field: i32| Mem::indexed(R10, R9, 8, JUMP_CACHE + field);
-    let mut code = Code::new();
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
     let mut misses: Vec<_> = gate(&mut asm, policy, R8, false).into_iter().collect();
@@ -2909,12 +3200,7 @@ fn lookup_tail_with_policy(
         asm.bind(miss);
     }
     // The plain tail's jump is relative to its own end in `code`.
-    tail(&mut code, at, word, ran, probe)?;
-    let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
-    for _ in 0..padding {
-        code.asm().int3();
-    }
-    code.try_into().ok()
+    tail(code, at, word, ran, probe)
 }
 
 /// Count a table probe transfer ([`StampCount::Filled`]) and fill this
@@ -3488,7 +3774,7 @@ mod tests {
         }
         assert!(link(0, LINK_BYTES + 1, 3, 7, 0).is_none());
         let word = 0x1122_3344_5566_7788;
-        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0xcccc_cccc_c366_7788);
+        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_0000_e966_7788);
     }
 
     #[test]
@@ -3506,7 +3792,7 @@ mod tests {
         expected.extend((0x2000i32 - 0x102c).to_le_bytes());
         expected.push(0xba);
         expected.extend(word.encoded().to_le_bytes());
-        expected.push(0xc3);
+        expected.extend(EXIT_RETURN);
         assert_eq!(code, expected);
         assert_eq!(code.len(), THUNK_BYTES);
         let back = thunk(0x1000, 7, 3, 0x2000, Fallback::Jump(0x800)).unwrap();
@@ -3653,10 +3939,14 @@ mod tests {
             core::ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
             core::ptr::copy_nonoverlapping(block.as_ptr(), base.add(BLOCK_AT), block.len());
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            type Thunk = unsafe extern "sysv64" fn(u64, u64) -> u128;
-            let dynamic: Thunk = core::mem::transmute(page);
-            let fixed: Thunk = core::mem::transmute(base.add(fixed_at));
-            let branch: Thunk = core::mem::transmute(base.add(branch_at));
+            let thunk = |at: *const u8| {
+                move |frame: u64, target: u64| {
+                    crate::x86_64::native::enter(at, frame as *mut crate::GuestState, target, 0)
+                }
+            };
+            let dynamic = thunk(page as *const u8);
+            let fixed = thunk(base.add(fixed_at));
+            let branch = thunk(base.add(branch_at));
             let exit = |result: u128| {
                 let word = (result >> 64) as u64;
                 (result as u64, ExitWord::split(word).0)
@@ -4028,7 +4318,14 @@ mod tests {
                     core::ptr::copy_nonoverlapping(block.as_ptr(), base.add(at), block.len());
                 }
                 assert_eq!(mprotect(page, PAGE, 5), 0);
-                let run: unsafe extern "sysv64" fn(u64) -> u128 = core::mem::transmute(page);
+                let run = |frame: u64| {
+                    crate::x86_64::native::enter(
+                        page as *const u8,
+                        frame as *mut crate::GuestState,
+                        0,
+                        0,
+                    )
+                };
                 let exit = |result: u128| {
                     let word = (result >> 64) as u64;
                     (result as u64, ExitWord::split(word).0)
@@ -4194,7 +4491,14 @@ mod tests {
                 );
             }
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            let ret: unsafe extern "sysv64" fn(u64, u64) -> u128 = core::mem::transmute(page);
+            let ret = |frame: u64, target: u64| {
+                crate::x86_64::native::enter(
+                    page as *const u8,
+                    frame as *mut crate::GuestState,
+                    target,
+                    0,
+                )
+            };
             let exit = |result: u128| (result as u64, ExitWord::split((result >> 64) as u64).0);
             control.budget = 100;
             // Returns to each caller in turn, through one site's tail.
@@ -4234,6 +4538,8 @@ mod tests {
     mod differential;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod jump_cache;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod paired;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod patching;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

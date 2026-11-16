@@ -881,7 +881,9 @@ fn totals(core: &Core) -> [[[u64; MAX_COUNTERS + 2]; BUCKETS + 1]; MAX_SETS] {
 /// ends. `method=window:NMticks` (RDPMC trapped): a leading `pe=` is the
 /// whole PE from every window, unbiased; each phase bucket comes only from
 /// the windows that phase held 90% of, so a phase that never dominates a
-/// window shows `-` (`fill` always does).
+/// window shows `-` (`fill` always does). Where no window measured `nat`
+/// alone, `nat~=C/I` is the whole PE's cycles and instructions times the
+/// shares of each native code took in the PE's `PES WHERE` samples.
 pub(crate) fn report(seen: &mut Seen) {
     let Some(layout) = shared_layout() else {
         return;
@@ -979,6 +981,7 @@ pub(crate) fn report(seen: &mut Seen) {
             now[set][bucket][MAX_COUNTERS].wrapping_sub(before[set][bucket][MAX_COUNTERS])
         };
         line.push_str(&format!(" {}:", core.pe));
+        let mut whole: Option<[u64; MAX_COUNTERS]> = None;
         for &bucket in &order {
             // The whole PE ran every phase's ticks.
             let ticks = if bucket == BUCKETS {
@@ -992,7 +995,21 @@ pub(crate) fn report(seen: &mut Seen) {
                 continue;
             }
             if sampled == 0 {
-                line.push_str(&format!(" {}=-", name(bucket)));
+                let estimate = (bucket == Phase::Native as usize)
+                    .then_some(whole)
+                    .flatten()
+                    .zip(super::sampling::native_share(&seen.sampled, core.pe));
+                match estimate {
+                    Some((whole, share)) => {
+                        let [cycles, instructions] = [0, 1].map(|counter: usize| {
+                            (u128::from(whole[counter]) * u128::from(share[counter]) / 1_000_000)
+                                as u64
+                                / 1_000_000
+                        });
+                        line.push_str(&format!(" nat~={cycles}/{instructions}"));
+                    }
+                    None => line.push_str(&format!(" {}=-", name(bucket))),
+                }
                 continue;
             }
             let mut scaled = [0u64; MAX_COUNTERS];
@@ -1003,6 +1020,9 @@ pub(crate) fn report(seen: &mut Seen) {
                 machine[bucket][counter] += scaled[counter];
             }
             ran[bucket] = true;
+            if bucket == BUCKETS {
+                whole = Some(scaled);
+            }
             format_bucket(&mut line, name(bucket), &scaled);
         }
         seen.totals[core.pe] = now;

@@ -8,6 +8,7 @@ use super::qarma;
 
 /// One `compute` of `data` and `modifier` under `key`, the key's high word
 /// first as [`qarma::compute`] takes it.
+#[inline]
 pub(super) fn compute(data: u64, modifier: u64, key: &[u64; 2]) -> u64 {
     #[cfg(target_arch = "x86_64")]
     if aes::available() {
@@ -47,15 +48,19 @@ pub(super) mod aes {
         0xba7c_9045_f12c_7f99,
     ]);
 
+    #[inline]
     pub(super) fn available() -> bool {
         match AES.load(Ordering::Relaxed) {
-            UNKNOWN => {
-                let present = core::arch::x86_64::__cpuid(1).ecx & CPUID_AES != 0;
-                AES.store(if present { PRESENT } else { ABSENT }, Ordering::Relaxed);
-                present
-            }
+            UNKNOWN => detect(),
             state => state == PRESENT,
         }
+    }
+
+    #[cold]
+    fn detect() -> bool {
+        let present = core::arch::x86_64::__cpuid(1).ecx & CPUID_AES != 0;
+        AES.store(if present { PRESENT } else { ABSENT }, Ordering::Relaxed);
+        present
     }
 
     // XMM0 is the state, XMM1 the key and XMM2 its round's key.
@@ -93,6 +98,7 @@ pub(super) mod aes {
     /// # Safety
     ///
     /// The processor implements AES-NI ([`available`]).
+    #[inline]
     pub(super) unsafe fn compute(data: u64, modifier: u64, key: &[u64; 2]) -> u64 {
         // SAFETY: the caller checked AES-NI; the routine reads only `key` and
         // the constants and clobbers only registers the ABI lets a call

@@ -585,6 +585,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.note_gone(&mut cache, slot, churn::Gone::Invalidated);
         }
         self.unlink_sources(&page);
+        // A paired frame pushed in one of them fails from here on.
+        if !page.is_empty() {
+            code.blocks.advance_epoch();
+        }
         cache.targets.forget_frames(frame..=frame, |_| true);
         let forgot = cache.index.forget_page(physical & !(FETCH_PAGE - 1));
         drop(cache);
@@ -1367,6 +1371,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let shared = self.code_hub.is_some();
         let now = self.host.counter();
+        // Before any of them retires: a paired frame pushed in one of them
+        // fails from here on.
+        if !step.is_empty() {
+            code.blocks.advance_epoch();
+        }
         for slot in step.iter().map(|&(_, slot)| slot as usize) {
             // On a shared board its rows stay until the slot takes its
             // next block: another PE still inside its section may be

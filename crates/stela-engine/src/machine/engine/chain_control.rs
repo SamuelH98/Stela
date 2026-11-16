@@ -233,6 +233,28 @@ impl Owner {
         self.budget().store(budget, Ordering::Relaxed);
         self.entered = budget;
     }
+    /// Let one native run keep up to `bound` paired frames, checked against
+    /// the retire epoch at `epoch` ([`ChainControl::retire_epoch`]), which
+    /// must live through every native call until the next change: 0 and 0
+    /// push none.
+    pub(super) fn set_frames(&mut self, bound: u32, epoch: u64) {
+        let control = self.storage.control.get();
+        // SAFETY: the sole owner writes these non-budget fields outside native execution.
+        unsafe {
+            core::ptr::addr_of_mut!((*control).frame_room).write(if epoch == 0 {
+                0
+            } else {
+                bound.saturating_mul(chain::FRAME_BYTES as u32)
+            });
+            core::ptr::addr_of_mut!((*control).retire_epoch).write(epoch);
+        }
+    }
+    /// What paired frames did since the storage was made
+    /// ([`chain::PairCount`]).
+    pub(super) fn pairs(&self) -> [u64; chain::PAIR_COUNTS] {
+        // SAFETY: native code writes them only within a call of this owner.
+        unsafe { core::ptr::addr_of!((*self.storage.control.get()).pairs).read() }
+    }
     /// The block that ended the last native call, the instructions of the
     /// blocks it chained out of, the transfers lookup probes made and the
     /// others. Native code counts no other transfers: each spends one of the
@@ -290,6 +312,12 @@ impl Owner {
             heat: unsafe { core::ptr::addr_of!((*control).heat).read() },
             loop_entries: self.loops().0,
             loop_iterated: self.loops().1,
+            // SAFETY: as for `table`.
+            frame_room: unsafe { core::ptr::addr_of!((*control).frame_room).read() },
+            reserved: 0,
+            // SAFETY: as for `table`.
+            retire_epoch: unsafe { core::ptr::addr_of!((*control).retire_epoch).read() },
+            pairs: self.pairs(),
         }
     }
 
