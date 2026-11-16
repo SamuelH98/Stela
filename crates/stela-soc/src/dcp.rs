@@ -131,7 +131,7 @@ pub enum Log {
     /// Cumulative presentation progress in the bounded log.
     PresentSummary { total: u64, last_swap: u32 },
     /// How swaps reached the scanout over a window of the counter.
-    Pacing(iomfb::Pacing),
+    Pacing(Box<iomfb::Pacing>),
     /// A named refusal, with the call's interface row.
     Refused(String),
     /// A swap shown before `io_fence_notify` named every surface it waited

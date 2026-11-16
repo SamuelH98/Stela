@@ -481,6 +481,15 @@ fn report_peaks() {
     }
 }
 
+/// A guest call waits for a job no processor started: a PE whose guest
+/// sleeps waiting for an interrupt is called to start it now. A sleeping PE
+/// wakes only for its guest or the host's service, so a queued job waited
+/// for the next PE that stopped to wait, or 20 ms for a busy one
+/// (`Taker::Busy`), while the guest's call slept and asked again.
+fn job_waiting() {
+    super::call_job_taker();
+}
+
 /// What the kext found of the Metal plugin, the bundle whose code this boot's
 /// trust cache lists. A multi-user boot's Metal clients cannot start without
 /// it. A missing plugin, whose directories a kext cannot create, is repaired
@@ -886,7 +895,8 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         if jobs.ran != 0 || jobs.deferred != 0 {
             output::arguments(format_args!(
                 "GPU JOBS ran={} total_us={} longest_us={} slices={} longest_slice_us={} \
-                 longest_queued_us={} deferred={} repeated={} waiting={} heap_rise={}M from={}M\n",
+                 longest_queued_us={} deferred={} repeated={} waiting={} heap_rise={}M from={}M \
+                 queued_mean_us={} resumed={} resumed_mean_us={} resumed_longest_us={}\n",
                 jobs.ran,
                 micros(jobs.ticks),
                 micros(jobs.longest),
@@ -898,6 +908,10 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
                 service.jobs_waiting(),
                 JOB_RISE.swap(0, Ordering::Relaxed) >> 20,
                 JOB_RISE_FROM.load(Ordering::Relaxed) >> 20,
+                micros(jobs.queued / jobs.ran.max(1)),
+                jobs.resumed,
+                micros(jobs.resumed_after / jobs.resumed.max(1)),
+                micros(jobs.longest_resumed_after),
             ));
         }
     }
@@ -1125,6 +1139,7 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
             served,
             wake: look_again,
             bundle,
+            job_waiting,
         },
     )))
 }

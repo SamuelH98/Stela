@@ -2040,7 +2040,13 @@ fn grouped_sha256_schedule_removes_only_the_intermediate_frame_round_trip() {
         let separate_bytes = body_bytes(&instructions[..1])
             + body_bytes(&instructions[1..4])
             + body_bytes(&instructions[4..]);
-        assert_eq!(body_bytes(&instructions) + 16, separate_bytes);
+        if target.supports(TargetCpu::Sha) {
+            // The rounds keep V in the block's homes, where SU0's result
+            // makes no frame round trip apart either.
+            assert!(body_bytes(&instructions) < separate_bytes);
+        } else {
+            assert_eq!(body_bytes(&instructions) + 16, separate_bytes);
+        }
 
         if (target.supports(TargetCpu::Sha) && !std::arch::is_x86_feature_detected!("sha"))
             || (target.supports(TargetCpu::Ssse3) && !std::arch::is_x86_feature_detected!("ssse3"))

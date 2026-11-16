@@ -760,12 +760,12 @@ fn emit_selected(
                     // A join lands here from a point that stored them all.
                     code.settle_vectors();
                 }
-                // A fused group addresses the state itself.
+                // A fused group reaches V as its hash rounds do.
                 let class_at = |at: usize| {
                     if fuse_simd
                         && super::simd::sha256::HashGroup::recognize(&instructions[at..]).is_some()
                     {
-                        VectorUse::Settle
+                        super::simd::sha256::group_vector_use(target)
                     } else {
                         vector_use(&instructions[at].operation, target)
                     }

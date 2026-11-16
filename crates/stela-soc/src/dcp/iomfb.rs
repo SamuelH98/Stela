@@ -215,7 +215,31 @@ pub struct Pacing {
     /// Vsyncs (`D588`) the notification clients answered, each from its
     /// vblank to the answer: the frame clock Core Animation paces by.
     pub vsync: Latency,
+    /// The gaps by whole refresh periods: 1, 2, 3, 4 to 7, and 8 or more.
+    /// An animation shows as short gaps between the long ones of a still
+    /// screen, which a window's average hides.
+    pub refreshes: [u32; 5],
+    /// The gaps of [`BURST_REFRESHES`] periods or fewer and their ticks:
+    /// the rate while frames keep coming, whatever the still time between.
+    pub burst_gaps: u32,
+    pub burst_ticks: u64,
+    /// Submits that followed a swap's completion answer, each from the
+    /// latest answer before it: how long the AP took to send its next frame
+    /// once it had a frame's surfaces back.
+    pub turnaround: Latency,
+    /// Each submit's vblank phase: from the last vblank to the submit.
+    pub after_vsync: Latency,
+    /// Submits made while an earlier swap's completion was not yet
+    /// answered, and the most swaps unanswered at one submit: none at
+    /// every submit means the AP sends a frame only once the last one
+    /// completed.
+    pub overlapped: u32,
+    pub most_unanswered: usize,
 }
+
+/// The longest gap, in refresh periods, still counted as part of a burst of
+/// frames ([`Pacing::burst_gaps`]): 7 periods, about 117 ms at 60 Hz.
+pub const BURST_REFRESHES: u64 = 7;
 
 /// A count of intervals, their total and the longest, in counter ticks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -283,6 +307,19 @@ impl Pacing {
         self.total_gap += gap;
         self.longest = self.longest.max(gap);
         self.stalls += u32::from(gap > 2 * refresh);
+        let periods = (gap + refresh / 2) / refresh.max(1);
+        let bucket = match periods {
+            0..=1 => 0,
+            2 => 1,
+            3 => 2,
+            4..=7 => 3,
+            _ => 4,
+        };
+        self.refreshes[bucket] += 1;
+        if periods <= BURST_REFRESHES {
+            self.burst_gaps += 1;
+            self.burst_ticks += gap;
+        }
     }
 }
 
@@ -322,6 +359,20 @@ impl core::fmt::Display for Pacing {
             self.complete,
             self.total,
             self.vsync,
+        )?;
+        let [one, two, three, few, many] = self.refreshes;
+        write!(
+            f,
+            " gaps=1:{one}/2:{two}/3:{three}/4-7:{few}/8+:{many} burst_fps={:.1} turnaround={} after_vsync={} overlapped={}/{}",
+            if self.burst_ticks == 0 {
+                0.0
+            } else {
+                f64::from(self.burst_gaps) * 1000.0 / ms(self.burst_ticks)
+            },
+            self.turnaround,
+            self.after_vsync,
+            self.overlapped,
+            self.most_unanswered,
         )
     }
 }
@@ -554,6 +605,12 @@ pub struct Methods {
     pacing: Pacing,
     window_start: Option<u64>,
     last_present: Option<(u64, u32)>,
+    /// The last vblank, the latest swap completion the AP answered since
+    /// the last submit, and whether a completion is out to the AP: what a
+    /// submit is timed against ([`Pacing::turnaround`]).
+    last_vblank: Option<u64>,
+    completion_answered: Option<u64>,
+    completing: bool,
     /// The monitor's power and sleep state, shared with its IOAV controller.
     display: Rc<RefCell<DisplayState>>,
     /// Whether the scanout's monitor is lit, as last set; it follows the
@@ -695,6 +752,9 @@ impl Methods {
             pacing: Pacing::default(),
             window_start: None,
             last_present: None,
+            last_vblank: None,
+            completion_answered: None,
+            completing: false,
             display,
             sink_powered: true,
             sink_power_refused: false,
@@ -900,6 +960,7 @@ impl Methods {
             self.next_refresh + behind * self.refresh_ticks
         };
         self.next_refresh = due + self.refresh_ticks;
+        self.last_vblank = Some(due);
         // The latch takes only what is ready at its vblank.
         self.latched = Some(due);
         self.frame_ready(now);
@@ -962,7 +1023,7 @@ impl Methods {
         }
         let pacing = core::mem::take(&mut self.pacing);
         if pacing.presented != 0 || pacing.submitted != 0 {
-            self.record_log(Log::Pacing(Pacing { ticks, ..pacing }));
+            self.record_log(Log::Pacing(Box::new(Pacing { ticks, ..pacing })));
         }
         self.window_start = Some(due);
     }
@@ -1936,6 +1997,7 @@ impl Service for Methods {
         input[SWAP_COMPLETE_DISPLAYED] = u8::from(displayed);
         input[SWAP_COMPLETE_DATA_NULL] = 1;
         self.in_flight = true;
+        self.completing = true;
         if self.trace_swap(swap_id) {
             self.callback_log(SWAP_COMPLETE, length, 0);
         }
@@ -1945,6 +2007,8 @@ impl Service for Methods {
             output: 0,
             then: Box::new(move |methods, _| {
                 methods.in_flight = false;
+                methods.completing = false;
+                methods.completion_answered = Some(methods.now);
                 if let Some((_, submitted, presented)) = times {
                     let now = methods.now;
                     methods.pacing.complete.add(now.saturating_sub(presented));
@@ -2048,6 +2112,7 @@ impl Methods {
             false
         });
         self.pacing.fence_waits += u32::from(fenced != 0);
+        self.pace_submit();
         self.frames.push_back(Frame {
             swap_id,
             client,
@@ -2070,6 +2135,23 @@ impl Methods {
 }
 
 impl Methods {
+    /// Time a submit at the counter's last reading against the last vblank
+    /// and the latest completion answered, and count the swaps still
+    /// waiting for their completion's answer: queued, presented and not
+    /// yet sent, or out to the AP.
+    fn pace_submit(&mut self) {
+        let now = self.now;
+        if let Some(vblank) = self.last_vblank {
+            self.pacing.after_vsync.add(now.saturating_sub(vblank));
+        }
+        if let Some(answered) = self.completion_answered.take() {
+            self.pacing.turnaround.add(now.saturating_sub(answered));
+        }
+        let unanswered = self.frames.len() + self.completed.len() + usize::from(self.completing);
+        self.pacing.overlapped += u32::from(unanswered != 0);
+        self.pacing.most_unanswered = self.pacing.most_unanswered.max(unanswered);
+    }
+
     /// Log each slot whose surface size, source rectangle or destination
     /// size `planes` changes, the first [`PLACEMENTS`] times: what the guest
     /// asks the scaler for. A destination that only moves (the cursor) is

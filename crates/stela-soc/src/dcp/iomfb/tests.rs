@@ -1500,9 +1500,29 @@ fn pacing_reports_rate_gaps_stalls_lateness_and_queue_depth() {
     assert_eq!(pacing.late_longest, 100);
     assert_eq!(pacing.late_total, 100 * u64::from(pacing.presented - 1));
     assert_eq!(pacing.submitted, pacing.presented + 1);
+    // By refresh periods: every gap one but the three-period one, all of
+    // them inside a burst.
+    assert_eq!(pacing.refreshes, [pacing.gaps - 1, 0, 1, 0, 0]);
+    assert_eq!(
+        (pacing.burst_gaps, pacing.burst_ticks),
+        (pacing.gaps, pacing.total_gap)
+    );
+    // Each submit after the first two follows a completion the AP
+    // answered and a vblank, 100 ticks after the look that presented; only
+    // the second went out with an earlier swap unanswered.
+    assert_eq!(pacing.turnaround.count, pacing.submitted - 2);
+    assert_eq!(pacing.after_vsync.count, pacing.submitted - 2);
+    assert_eq!(pacing.after_vsync.longest, 100);
+    assert_eq!((pacing.overlapped, pacing.most_unanswered), (1, 1));
     let line = pacing.to_string();
     assert!(
         line.starts_with("DCP PACING seconds=10.0 presented=") && line.contains(" merged=1 "),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" gaps=1:{}/2:0/3:1/4-7:0/8+:0 ", pacing.gaps - 1))
+            && line.contains(" burst_fps=")
+            && line.ends_with(" overlapped=1/1"),
         "{line}"
     );
     // A window in which nothing was submitted or shown is not reported.
