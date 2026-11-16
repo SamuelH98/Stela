@@ -213,6 +213,116 @@ fn lockdown_mode_reads_as_off_and_other_variables_refuse() {
 }
 
 #[test]
+fn the_engines_initial_variables_read_as_it_sets_them() {
+    let mut credentials = Credentials::default();
+    for (variable, value) in [(5u32, 0u8), (6, 0), (7, 0), (26, 0), (33, 1), (34, 0)] {
+        assert_eq!(
+            ask(
+                &mut credentials,
+                &mut counter(),
+                25,
+                &variable.to_le_bytes()
+            ),
+            (0, alloc::vec![value]),
+            "variable {variable}"
+        );
+    }
+    // Bytes after the variable are not read.
+    let mut long = 7u32.to_le_bytes().to_vec();
+    long.extend_from_slice(&[0xaa; 4]);
+    assert_eq!(
+        ask(&mut credentials, &mut counter(), 25, &long),
+        (0, alloc::vec![0])
+    );
+    // No input, and less than the variable.
+    assert_eq!(
+        ask(&mut credentials, &mut counter(), 25, &[]),
+        (BAD_PARAMETER, Vec::new())
+    );
+    assert_eq!(
+        ask(&mut credentials, &mut counter(), 25, &[7, 0]),
+        (-5i32 as u32, Vec::new())
+    );
+    // Variables set later, or by data providers (69, the context pool's
+    // statistics), are named once each.
+    refused(&mut credentials, 25, &16u32.to_le_bytes());
+    refused(&mut credentials, 25, &69u32.to_le_bytes());
+    refused(&mut credentials, 25, &69u32.to_le_bytes());
+    let notes: Vec<_> = credentials.diagnostics().collect();
+    assert_eq!(
+        notes,
+        [
+            "SEP credential manager: environment variable 16 is not modeled",
+            "SEP credential manager: environment variable 69 is not modeled",
+        ]
+    );
+}
+
+#[test]
+fn biometric_policies_are_never_satisfied_without_biometry() {
+    let mut credentials = Credentials::default();
+    let mut entropy = counter();
+    let (handle, _) = create(&mut credentials, &mut entropy);
+    // The lone biometry leaf as allocated: type 3, state 1, +8 1 and the
+    // data size of the version, its bytes zero.
+    let leaf = |data: u32| {
+        let mut bytes = 0u32.to_le_bytes().to_vec();
+        for word in [3u32, 1, 1, data] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.resize(bytes.len() + data as usize, 0);
+        bytes
+    };
+    for policy in [
+        &b"HumanPresence"[..],
+        b"UserIdentificationWithBiometrics",
+        b"DeviceOwnerAuthenticationWithBiometrics",
+    ] {
+        assert_eq!(
+            ask(
+                &mut credentials,
+                &mut entropy,
+                3,
+                &verify_policy(&handle, policy, true)
+            ),
+            (0, leaf(0xdd))
+        );
+    }
+    // A validated passcode does not satisfy biometry.
+    credentials.passcode_validated(&handle).unwrap();
+    assert_eq!(
+        ask(
+            &mut credentials,
+            &mut entropy,
+            3,
+            &verify_policy(&handle, b"DeviceOwnerAuthenticationWithBiometrics", false)
+        ),
+        (0, leaf(0xdd))
+    );
+    assert_eq!(
+        ask_version(
+            &mut credentials,
+            &mut entropy,
+            3,
+            1,
+            &verify_policy(&handle, b"UserIdentificationWithBiometrics", false)
+        ),
+        (0, leaf(0x9c))
+    );
+    // An unknown context is still ACM's own answer.
+    assert_eq!(
+        ask(
+            &mut credentials,
+            &mut entropy,
+            3,
+            &verify_policy(&[9; 16], b"HumanPresence", true)
+        ),
+        (NO_CONTEXT, Vec::new())
+    );
+    assert!(credentials.diagnostics().next().is_none());
+}
+
+#[test]
 fn the_supported_version_is_two_for_exactly_one_byte() {
     let mut credentials = Credentials::default();
     assert_eq!(

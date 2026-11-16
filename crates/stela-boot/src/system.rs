@@ -875,6 +875,10 @@ fn load(
         ));
     }
     crate::status::begin("Taking control of the other processors");
+    // Named before the buffer's allocation, the last one: the firmware's
+    // exit can take long, and the screen keeps this detail through it. The
+    // next detail logs its time (`status::progress`).
+    crate::status::progress("the firmware ends its boot services");
     // The last allocation Stela makes before the exit: from here to the
     // exit's own map read only the firmware's timer and logs close.
     let final_map = crate::boot_exit::Buffer::allocate();

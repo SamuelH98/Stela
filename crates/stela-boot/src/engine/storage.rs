@@ -2166,11 +2166,19 @@ pub unsafe fn open(
             Ok(opened) => break opened,
             Err((at, error)) if at >= required => {
                 let (named, which) = optional.remove(at - required);
+                let why = describe(&named, error);
                 output::arguments(format_args!(
-                    "HOST PARTITION {} left out: {}\n",
+                    "HOST PARTITION {} left out: {why}\n",
                     which.role(),
-                    describe(&named, error)
                 ));
+                // The USB's log has nothing since the firmware's exit and
+                // gets nothing more: the screen says so once.
+                if matches!(which, Optional::Log) {
+                    output::log_lost(
+                        output::Log::Usb,
+                        format_args!("Stela's drivers did not find its partition: {why}"),
+                    );
+                }
             }
             Err((at, error)) => {
                 let role = role_of(at, targets.len(), medium.is_some(), preboot.is_some());

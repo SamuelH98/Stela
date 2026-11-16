@@ -25,6 +25,11 @@
 //! global set (`addCredential` 0xfffffe0009290c80, "scope ==
 //! kACMScopeContext" with scope 1).
 //!
+//! **Environment.** GetEnvironmentVariable answers Lockdown Mode (41) as off
+//! and the one-byte variables the engine's initialization sets as it sets
+//! them; variables set later, by the AP or with data providers, are not
+//! modeled.
+//!
 //! **Model.** Only PassphraseEntered is added from the AP: PasscodeValidated
 //! comes from the keystore's verify ([`Link::passcode_validated`]), so no
 //! client can claim a passcode it did not give. The global set, other
@@ -79,6 +84,17 @@ const INITIAL_LOGGING_LEVEL: u8 = 0x28;
 /// The environment variable `LDMCheckParity` compares with NVRAM.
 const LOCKDOWN_MODE: u32 = 41;
 const LOCKDOWN_OFF: u8 = 0;
+/// The one-byte environment variables `InitCredentialEngine`
+/// 0xfffffe0009294a40 sets, whose slots (`__envTable` 0xfffffe000cb3d520,
+/// 0x98 bytes each) any caller may read and nothing else in the executor
+/// sets: 5 (+0x150), 6, the biometry type `biometryTypePresent` reads
+/// (+0x98, 0: none), 7 (+0x2ac), 26 (+0x2c8), 33 (+0x2e4, 1) and 34
+/// (+0x300). Variable 23 (from the engine's boot parameters), 24 (the
+/// engine's build date) and those with data providers are not among them.
+const INITIAL_VARIABLES: [(u32, u8); 6] = [(5, 0), (6, 0), (7, 0), (26, 0), (33, 1), (34, 0)];
+/// The executor's answer to a command shorter than its input
+/// (`Exec_ACMGetEnvironmentVariable`+0x194).
+const SHORT_COMMAND: i32 = -5;
 
 const SETS: usize = 0x100;
 const NON_AUTO_DISPOSABLE_SETS: usize = 0xc0;
@@ -297,13 +313,7 @@ impl Credentials {
                 Ok(u32::from(found).to_le_bytes().to_vec())
             }
             VERIFY_POLICY => self.verify_policy(head.version, input),
-            GET_ENVIRONMENT_VARIABLE
-                if input.len() == 4 && input == LOCKDOWN_MODE.to_le_bytes() =>
-            {
-                // LDMCheckParity reads one byte: Lockdown Mode is off, so
-                // enabling it does not survive a reboot.
-                Ok(vec![LOCKDOWN_OFF])
-            }
+            GET_ENVIRONMENT_VARIABLE => self.environment_variable(input),
             command => {
                 let leading = input.get(..4).map_or(0, |word| {
                     u32::from_le_bytes(word.try_into().expect("4 bytes"))
@@ -319,6 +329,37 @@ impl Credentials {
                 ))
             }
         }
+    }
+
+    /// GetEnvironmentVariable (`Exec_ACMGetEnvironmentVariable`
+    /// 0xfffffe000928948c): no input is -3, less than the u32 variable is
+    /// -5, and bytes after it are not read. The variables
+    /// `InitCredentialEngine` sets ([`INITIAL_VARIABLES`]) answer their byte,
+    /// as `Env_GetVariable` 0xfffffe00092c0aa8 copies a stored value; every
+    /// other variable is outside the model.
+    fn environment_variable(&mut self, input: &[u8]) -> core::result::Result<Vec<u8>, Failure> {
+        if input.is_empty() {
+            return Err(BAD_PARAMETER.into());
+        }
+        let Some(word) = input.get(..4) else {
+            return Err(SHORT_COMMAND.into());
+        };
+        let variable = u32::from_le_bytes(word.try_into().expect("4 bytes"));
+        if variable == LOCKDOWN_MODE {
+            // LDMCheckParity reads one byte: Lockdown Mode is off, so
+            // enabling it does not survive a reboot.
+            return Ok(vec![LOCKDOWN_OFF]);
+        }
+        if let Some((_, value)) = INITIAL_VARIABLES.iter().find(|(id, _)| *id == variable) {
+            return Ok(vec![*value]);
+        }
+        Err(self.unmodeled(
+            format!("environment variable {variable} is not modeled"),
+            refuse!(
+                "SEP credential manager does not model this environment variable",
+                variable
+            ),
+        ))
     }
 
     fn global(&mut self, what: &'static str) -> Failure {
@@ -497,7 +538,10 @@ impl Credentials {
             .credentials
             .iter()
             .any(|credential| credential.kind == PASSCODE_VALIDATED);
-        let (satisfied, requirement) = policy::device_owner(policy, version, passcode);
+        let (satisfied, requirement) = match policy {
+            policy::Policy::Biometrics => policy::biometrics(version),
+            _ => policy::device_owner(policy, version, passcode),
+        };
         if satisfied && !request.preflight {
             self.report(String::from(
                 "credential usage counts are not kept: a PasscodeValidated credential lasts as long as its context",

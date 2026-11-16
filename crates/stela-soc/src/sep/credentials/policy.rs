@@ -27,7 +27,16 @@
 //! size is the allocation's from version 2 (+0xc) and the table at
 //! 0xfffffe000744e228 below it, which differ only for biometry.
 //!
-//! **Model.** No biometry and no watch credential exist on this machine, so
+//! HumanPresence, UserIdentificationWithBiometrics and
+//! DeviceOwnerAuthenticationWithBiometrics call `verifyPolicyBiometrics`
+//! 0xfffffe000929aec4: a lone biometry requirement (type 3,
+//! `Util_CreateRequirement`), which stays as allocated, state 1, when
+//! `biometryTypePresent` 0xfffffe000929ee34 reads environment variable 6 as
+//! 0, and the call succeeds; `_verifyPolicy` answers satisfied only for state
+//! 2 (+0x5ac).
+//!
+//! **Model.** No biometry and no watch credential exist on this machine
+//! (environment variable 6 is 0, as `InitCredentialEngine` sets it), so
 //! those children stay 1 and only PasscodeValidated satisfies the root. The
 //! biometry child's 0xdd data bytes stay zero, as nothing is matched.
 use super::acm::{BAD_PARAMETER, HANDLE_BYTES, Handle};
@@ -117,6 +126,8 @@ impl<'a> Request<'a> {
 pub(super) enum Policy {
     DeviceOwner,
     DeviceAdmin,
+    /// `verifyPolicyBiometrics`'s policies.
+    Biometrics,
 }
 
 impl Policy {
@@ -127,9 +138,32 @@ impl Policy {
             | b"DeviceOwnerAuthenticated"
             | b"UserPresence" => Some(Self::DeviceOwner),
             b"DeviceAdminAuthentication" => Some(Self::DeviceAdmin),
+            b"HumanPresence"
+            | b"UserIdentificationWithBiometrics"
+            | b"DeviceOwnerAuthenticationWithBiometrics" => Some(Self::Biometrics),
             _ => None,
         }
     }
+}
+
+/// The biometry data size the requirement serializer gives for `version`.
+fn biometry_data(version: u8) -> u32 {
+    if version >= 2 {
+        BIOMETRY_DATA_V2
+    } else {
+        BIOMETRY_DATA_V1
+    }
+}
+
+/// A biometric policy on a machine with no biometry: never satisfied, and
+/// its requirement is the biometry leaf as allocated, serialized for
+/// `version`.
+pub(super) fn biometrics(version: u8) -> (bool, Vec<u8>) {
+    let data = biometry_data(version);
+    let mut bytes = Vec::new();
+    node(&mut bytes, BIOMETRY, REQUIRED, data);
+    bytes.resize(bytes.len() + data as usize, 0);
+    (false, bytes)
 }
 
 /// Whether `policy` is satisfied with or without a PasscodeValidated
@@ -143,11 +177,7 @@ pub(super) fn device_owner(_policy: Policy, version: u8, passcode: bool) -> (boo
     } else {
         REQUIRED
     };
-    let biometry_data = if version >= 2 {
-        BIOMETRY_DATA_V2
-    } else {
-        BIOMETRY_DATA_V1
-    };
+    let biometry_data = biometry_data(version);
     let mut bytes = Vec::new();
     node(&mut bytes, K_OF_N, root_state, K_OF_N_DATA);
     bytes.extend_from_slice(&1u32.to_le_bytes());
