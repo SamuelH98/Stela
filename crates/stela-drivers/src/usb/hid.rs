@@ -110,12 +110,22 @@ async fn read_descriptor(
         u16::from(interface.number),
         length,
     );
-    let bytes = control(request).await?;
-    if bytes.len() != usize::from(length) {
-        return Err(BlockError::Protocol("short USB HID report descriptor"));
+    // `hid_get_class_descriptor` makes up to four attempts: some keyboard
+    // firmware stalls or truncates the first fetch right after configuration.
+    let mut last = BlockError::Protocol("short USB HID report descriptor");
+    for _ in 0..DESCRIPTOR_ATTEMPTS {
+        match control(request).await {
+            Ok(bytes) if bytes.len() == usize::from(length) => return Ok(bytes),
+            Ok(_) => last = BlockError::Protocol("short USB HID report descriptor"),
+            Err(error @ BlockError::Device { .. }) => last = error,
+            Err(error) => return Err(error),
+        }
     }
-    Ok(bytes)
+    Err(last)
 }
+
+/// Attempts at the report descriptor fetch, as in Linux `hid_get_class_descriptor`.
+const DESCRIPTOR_ATTEMPTS: usize = 4;
 
 fn descriptor_length(interface: &Interface) -> Result<u16, &'static str> {
     let descriptor = interface

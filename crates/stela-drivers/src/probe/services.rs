@@ -64,6 +64,12 @@ pub enum ServiceError {
     /// The mount refuses it, such as a requester its IOMMU cannot isolate.
     Refused(&'static str),
     Mapping(owned::Error),
+    /// A mapping refused at a known window, so a conflict names the range.
+    MappingWindow {
+        physical: u64,
+        bytes: u64,
+        error: owned::Error,
+    },
     Claim(ClaimError),
 }
 
@@ -74,6 +80,14 @@ impl fmt::Display for ServiceError {
             Self::Unavailable => f.write_str("native resource service unavailable"),
             Self::Refused(why) => f.write_str(why),
             Self::Mapping(error) => write!(f, "native mapping: {error:?}"),
+            Self::MappingWindow {
+                physical,
+                bytes,
+                error,
+            } => write!(
+                f,
+                "native mapping of {bytes:#x} bytes at {physical:#x}: {error:?}"
+            ),
             Self::Config(error) => error.fmt(f),
             Self::PciCapability(error) => write!(f, "PCI capability: {error:?}"),
             Self::Claim(error) => write!(f, "stopped requester: {error:?}"),

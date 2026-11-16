@@ -680,6 +680,8 @@ mod attach {
                         "I2C controller window under 256 bytes",
                     ));
                 }
+                let window = logical.start() as u64;
+                let span = logical.bytes() as u64;
                 let mapping = services
                     .authority()
                     .map_err(native)?
@@ -690,7 +692,13 @@ mod attach {
                         CacheAttribute::Uncached,
                         Protection::ReadWrite,
                     )
-                    .map_err(|error| native(ServiceError::Mapping(error)))?;
+                    .map_err(|error| {
+                        native(ServiceError::MappingWindow {
+                            physical: window,
+                            bytes: span,
+                            error,
+                        })
+                    })?;
                 let mapping = ManuallyDrop::new(mapping);
                 let board = timing::Board {
                     clock_hz,

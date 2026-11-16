@@ -640,3 +640,30 @@ fn retired_identity_refuses_old_hid_control_poll_and_restart_without_dma_mutatio
 mod delimiter;
 mod sparse;
 pub(super) mod touch;
+
+#[test]
+fn a_stalled_report_descriptor_fetch_is_retried_like_hid_get_class_descriptor() {
+    let keyboard = [5u8, 1, 9, 6, 0xa1, 1, 0xc0];
+    let interface = interface(&keyboard, 0, 0);
+    let mut calls = 0;
+    let fetched =
+        stela_driver_base::stepped::block_on(read_descriptor(&interface, &mut async |_| {
+            calls += 1;
+            if calls < DESCRIPTOR_ATTEMPTS {
+                Err(BlockError::Device { status: STALL })
+            } else {
+                Ok(keyboard.to_vec())
+            }
+        }));
+    assert_eq!(fetched, Ok(keyboard.to_vec()));
+    assert_eq!(calls, DESCRIPTOR_ATTEMPTS);
+
+    let mut calls = 0;
+    let fetched =
+        stela_driver_base::stepped::block_on(read_descriptor(&interface, &mut async |_| {
+            calls += 1;
+            Err(BlockError::Device { status: STALL })
+        }));
+    assert_eq!(fetched, Err(BlockError::Device { status: STALL }));
+    assert_eq!(calls, DESCRIPTOR_ATTEMPTS);
+}
